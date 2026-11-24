@@ -41,6 +41,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from ..config import LLM_STRATEGY_FAILOVER, LLM_STRATEGY_METADATA, LLMStrategyConfig
+from .llm_interface import ProviderRateLimitResetError
 from .llm_wrapper import LLMProvider, OutputTooLongError
 
 if TYPE_CHECKING:
@@ -197,6 +198,7 @@ class MultiLLMProvider:
         self, method_name: str, accept_reply: Callable[[Any], bool] | None = None, **kwargs: Any
     ) -> Any:
         last_exc: BaseException | None = None
+        failures: list[BaseException] = []
         rejected: Any = None
         order = self._member_order()
         for position, idx in enumerate(order):
@@ -225,6 +227,7 @@ class MultiLLMProvider:
                 if not _should_failover(e):
                     raise
                 last_exc = e
+                failures.append(e)
                 remaining = len(order) - position - 1
                 cooldown = self._cool_down(idx)
                 logger.warning(
@@ -247,6 +250,11 @@ class MultiLLMProvider:
         if rejected is not None:
             return rejected
         assert last_exc is not None  # the loop ran at least once
+        # When every member reported a quota reset time, the caller defers until that time.
+        # Surface the earliest one: which member happened to be tried last (cooling members
+        # go last) must not decide how long the work stays parked.
+        if all(isinstance(e, ProviderRateLimitResetError) for e in failures):
+            raise min(failures, key=lambda e: e.retry_at)  # type: ignore[attr-defined]
         raise last_exc
 
     async def call(

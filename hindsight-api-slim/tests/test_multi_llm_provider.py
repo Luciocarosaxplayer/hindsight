@@ -5,10 +5,12 @@ a sentinel or raise a chosen exception. No real providers / network.
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from hindsight_api.config import LLMStrategyConfig
+from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
 from hindsight_api.engine.llm_wrapper import OutputTooLongError
 from hindsight_api.engine.multi_llm import (
     MultiLLMProvider,
@@ -94,6 +96,28 @@ async def test_failover_reraises_last_exception_when_all_fail():
     with pytest.raises(ValueError, match="last"):
         await _failover(a, b).call(messages=[])
     assert (a.calls, b.calls) == (1, 1)
+
+
+async def test_all_rate_limited_raises_the_earliest_reset(monkeypatch):
+    now = datetime.now(timezone.utc)
+    soon = ProviderRateLimitResetError(now + timedelta(hours=2), "soon")
+    late = ProviderRateLimitResetError(now + timedelta(days=3), "late")
+    a, b = FakeMember("a", soon), FakeMember("b", late)
+    chain = MultiLLMProvider([a, b], LLMStrategyConfig(mode="failover", cooldown_seconds=60))
+    # `a` cools down first, so on the next request `b` (+3d) is tried before it.
+    with pytest.raises(ProviderRateLimitResetError, match="soon"):
+        await chain.call(messages=[])
+    # Now `a` (+2h) is the one in cooldown and is tried last; the earliest reset still wins.
+    with pytest.raises(ProviderRateLimitResetError, match="soon"):
+        await chain.call(messages=[])
+    assert [m.calls for m in (a, b)] == [2, 2]
+
+
+async def test_mixed_rate_limit_and_other_failure_keeps_last_exception():
+    soon = ProviderRateLimitResetError(datetime.now(timezone.utc) + timedelta(hours=2), "soon")
+    a, b = FakeMember("a", soon), FakeMember("b", ValueError("last"))
+    with pytest.raises(ValueError, match="last"):
+        await _failover(a, b).call(messages=[])
 
 
 async def test_call_with_tools_fails_over_too():
